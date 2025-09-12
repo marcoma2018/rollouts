@@ -54,6 +54,7 @@ func init() {
 	watchedWorkload = sync.Map{}
 	watchedWorkload.LoadOrStore(util.ControllerKindDep.String(), struct{}{})
 	watchedWorkload.LoadOrStore(util.ControllerKindSts.String(), struct{}{})
+	watchedWorkload.LoadOrStore(util.ControllerKindDS.String(), struct{}{})
 	watchedWorkload.LoadOrStore(util.ControllerKruiseKindCS.String(), struct{}{})
 	watchedWorkload.LoadOrStore(util.ControllerKruiseKindSts.String(), struct{}{})
 	watchedWorkload.LoadOrStore(util.ControllerKruiseOldKindSts.String(), struct{}{})

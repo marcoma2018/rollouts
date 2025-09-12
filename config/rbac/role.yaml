@@ -103,6 +103,26 @@ rules:
   - patch
   - update
 - apiGroups:
+  - apps
+  resources:
+  - daemonsets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - daemonsets/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
   - apps.kruise.io
   resources:
   - clonesets

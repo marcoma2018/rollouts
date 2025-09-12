@@ -113,7 +113,7 @@ func (r *ControllerFinder) canaryStyleFinders() []ControllerFinderFunc {
 }
 
 func (r *ControllerFinder) partitionStyleFinders() []ControllerFinderFunc {
-	return []ControllerFinderFunc{r.getKruiseCloneSet, r.getAdvancedDeployment, r.getStatefulSetLikeWorkload, r.getKruiseDaemonSet}
+	return []ControllerFinderFunc{r.getKruiseCloneSet, r.getAdvancedDeployment, r.getStatefulSetLikeWorkload, r.getKruiseDaemonSet, r.getNativeDaemonSet}
 }
 
 func (r *ControllerFinder) bluegreenStyleFinders() []ControllerFinderFunc {
@@ -124,6 +124,7 @@ var (
 	ControllerKindRS           = apps.SchemeGroupVersion.WithKind("ReplicaSet")
 	ControllerKindDep          = apps.SchemeGroupVersion.WithKind("Deployment")
 	ControllerKindSts          = apps.SchemeGroupVersion.WithKind("StatefulSet")
+	ControllerKindDS           = apps.SchemeGroupVersion.WithKind("DaemonSet") // Add this for native DaemonSet
 	ControllerKruiseKindCS     = appsv1alpha1.SchemeGroupVersion.WithKind("CloneSet")
 	ControllerKruiseKindDS     = appsv1alpha1.SchemeGroupVersion.WithKind("DaemonSet")
 	ControllerKruiseKindSts    = appsv1beta1.SchemeGroupVersion.WithKind("StatefulSet")
@@ -213,6 +214,65 @@ func (r *ControllerFinder) getKruiseDaemonSet(namespace string, ref *rolloutv1be
 	// if daemonSet.Status.CurrentRevision == cloneSet.Status.UpdateRevision && cloneSet.Status.UpdatedReplicas != cloneSet.Status.Replicas {
 	// 	workload.IsInRollback = true
 	// }
+	return workload, nil
+}
+
+func (r *ControllerFinder) getNativeDaemonSet(namespace string, ref *rolloutv1beta1.ObjectRef) (*Workload, error) {
+	// This error is irreversible, so there is no need to return error
+	ok, _ := verifyGroupKind(ref, ControllerKindDS.Kind, []string{ControllerKindDS.Group})
+	if !ok {
+		return nil, nil
+	}
+	daemonSet := &apps.DaemonSet{}
+	err := r.Get(context.TODO(), client.ObjectKey{Namespace: namespace, Name: ref.Name}, daemonSet)
+	if err != nil {
+		// when error is NotFound, it is ok here.
+		if errors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if daemonSet.Generation != daemonSet.Status.ObservedGeneration {
+		return &Workload{IsStatusConsistent: false}, nil
+	}
+
+	// For native DaemonSet, we need to calculate the status fields differently
+	// since it doesn't have the advanced status fields that Kruise DaemonSet provides
+	workload := &Workload{
+		RevisionLabelKey:   "",
+		ObjectMeta:         daemonSet.ObjectMeta,
+		TypeMeta:           daemonSet.TypeMeta,
+		Replicas:           daemonSet.Status.DesiredNumberScheduled,
+		IsStatusConsistent: true,
+	}
+
+	// Read stable revision from label (set by webhook)
+	stableRevision := daemonSet.Labels["rollouts.kruise.io/stable-revision"]
+	workload.StableRevision = stableRevision
+
+	// Calculate update revision based on template hash
+	revisionHash := ComputeHash(&daemonSet.Spec.Template, nil)
+	workload.CanaryRevision = revisionHash
+	workload.PodTemplateHash = revisionHash
+
+	// not in rollout progressing
+	if _, ok = workload.Annotations[InRolloutProgressingAnnotation]; !ok {
+		return workload, nil
+	}
+
+	// in rollout progressing
+	workload.InRolloutProgressing = true
+
+	// For rollback detection in native DaemonSet:
+	// We'll use a simple approach - if all scheduled pods are updated,
+	// and we're in rollout progressing, we might be in a rollback scenario
+	if daemonSet.Status.UpdatedNumberScheduled == daemonSet.Status.DesiredNumberScheduled &&
+		daemonSet.Status.DesiredNumberScheduled > 0 {
+		// This could indicate we're rolling back to a previous version,
+		// but we need more context to be sure
+		workload.IsInRollback = false // Conservative approach for now
+	}
+
 	return workload, nil
 }
 

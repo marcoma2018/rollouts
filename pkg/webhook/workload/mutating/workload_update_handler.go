@@ -186,6 +186,35 @@ func (h *WorkloadHandler) Handle(ctx context.Context, req admission.Request) adm
 				return admission.Errored(http.StatusInternalServerError, err)
 			}
 			return admission.PatchResponseFromRaw(original, marshaled)
+		case util.ControllerKindDS.Kind:
+			// check native daemonset
+			newObj := &apps.DaemonSet{}
+			if err := h.Decoder.Decode(req, newObj); err != nil {
+				return admission.Errored(http.StatusBadRequest, err)
+			}
+			newObjClone := newObj.DeepCopy()
+			oldObj := &apps.DaemonSet{}
+			if err := h.Decoder.Decode(
+				admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Object: req.AdmissionRequest.OldObject}},
+				oldObj); err != nil {
+				return admission.Errored(http.StatusBadRequest, err)
+			}
+			changed, err := h.handleNativeDaemonSet(newObjClone, oldObj)
+			if err != nil {
+				return admission.Errored(http.StatusBadRequest, err)
+			}
+			if !changed {
+				return admission.Allowed("")
+			}
+			marshaled, err := json.Marshal(newObjClone)
+			if err != nil {
+				return admission.Errored(http.StatusInternalServerError, err)
+			}
+			original, err := json.Marshal(newObj)
+			if err != nil {
+				return admission.Errored(http.StatusInternalServerError, err)
+			}
+			return admission.PatchResponseFromRaw(original, marshaled)
 		}
 	}
 
@@ -355,7 +384,6 @@ func (h *WorkloadHandler) handleDaemonSet(newObj, oldObj *kruiseappsv1alpha1.Dae
 	} else if rollout == nil || rollout.Spec.Strategy.IsEmptyRelease() {
 		return false, nil
 	}
-
 	newObj.Spec.UpdateStrategy.RollingUpdate.Partition = pointer.Int32(math.MaxInt16)
 	state := &util.RolloutState{RolloutName: rollout.Name}
 	by, _ := json.Marshal(state)
@@ -460,4 +488,44 @@ func constructAttr(req admission.Request) (admission2.Attributes, error) {
 			Version:  req.Resource.Version,
 			Resource: req.Resource.Resource,
 		}, req.SubResource, admission2.Operation(req.Operation), nil, *req.DryRun, nil), nil
+}
+
+func (h *WorkloadHandler) handleNativeDaemonSet(newObj, oldObj *apps.DaemonSet) (bool, error) {
+	// indicate whether the workload can enter the rollout process
+
+	if newObj.Annotations[appsv1beta1.RolloutIDLabel] != "" &&
+		oldObj.Annotations[appsv1beta1.RolloutIDLabel] == newObj.Annotations[appsv1beta1.RolloutIDLabel] {
+		return false, nil
+	} else if newObj.Annotations[appsv1beta1.RolloutIDLabel] == "" && util.EqualIgnoreHash(&oldObj.Spec.Template, &newObj.Spec.Template) {
+		return false, nil
+	}
+
+	rollout, err := h.fetchMatchedRollout(newObj)
+	if err != nil {
+		return false, err
+	} else if rollout == nil || rollout.Spec.Strategy.IsEmptyRelease() {
+		return false, nil
+	}
+
+	// Set stable revision label for native DaemonSet if not already set
+	// This is similar to how DeploymentStableRevisionLabel is handled for Deployments
+	if newObj.Labels == nil {
+		newObj.Labels = map[string]string{}
+	}
+	// If this is the first time entering rollout, set the stable revision to current template hash
+	if _, ok := newObj.Labels["rollouts.kruise.io/stable-revision"]; !ok {
+		stableRevision := util.ComputeHash(&newObj.Spec.Template, nil)
+		newObj.Labels["rollouts.kruise.io/stable-revision"] = stableRevision
+	}
+
+	// For native DaemonSet, we use OnDelete strategy to enable manual pod deletion for batch control
+	newObj.Spec.UpdateStrategy.Type = apps.OnDeleteDaemonSetStrategyType
+	state := &util.RolloutState{RolloutName: rollout.Name}
+	by, _ := json.Marshal(state)
+	if newObj.Annotations == nil {
+		newObj.Annotations = map[string]string{}
+	}
+	newObj.Annotations[util.InRolloutProgressingAnnotation] = string(by)
+	klog.Infof("Native DaemonSet(%s/%s) will be released incrementally based on Rollout(%s)", newObj.Namespace, newObj.Name, rollout.Name)
+	return true, nil
 }
