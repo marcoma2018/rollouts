@@ -264,13 +264,10 @@ func (r *ControllerFinder) getNativeDaemonSet(namespace string, ref *rolloutv1be
 	workload.InRolloutProgressing = true
 
 	// For rollback detection in native DaemonSet:
-	// We'll use a simple approach - if all scheduled pods are updated,
-	// and we're in rollout progressing, we might be in a rollback scenario
-	if daemonSet.Status.UpdatedNumberScheduled == daemonSet.Status.DesiredNumberScheduled &&
-		daemonSet.Status.DesiredNumberScheduled > 0 {
-		// This could indicate we're rolling back to a previous version,
-		// but we need more context to be sure
-		workload.IsInRollback = false // Conservative approach for now
+	// Compare the stable revision (from label) with the canary revision (from template hash)
+	// If they match, it means we're rolling back to a previous version
+	if workload.StableRevision != "" && workload.StableRevision == workload.CanaryRevision {
+		workload.IsInRollback = true
 	}
 
 	return workload, nil

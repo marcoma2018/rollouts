@@ -513,9 +513,11 @@ func (h *WorkloadHandler) handleNativeDaemonSet(newObj, oldObj *apps.DaemonSet) 
 		newObj.Labels = map[string]string{}
 	}
 	// If this is the first time entering rollout, set the stable revision to current template hash
-	if _, ok := newObj.Labels["rollouts.kruise.io/stable-revision"]; !ok {
-		stableRevision := util.ComputeHash(&newObj.Spec.Template, nil)
-		newObj.Labels["rollouts.kruise.io/stable-revision"] = stableRevision
+	// If it's already set, preserve it (important for rollback scenarios)
+	// Use DeploymentStableRevisionLabel for consistency, even though it's a DaemonSet
+	if _, ok := newObj.Labels[appsv1beta1.DeploymentStableRevisionLabel]; !ok {
+		stableRevision := util.ComputeHash(&oldObj.Spec.Template, nil)
+		newObj.Labels[appsv1beta1.DeploymentStableRevisionLabel] = stableRevision
 	}
 
 	// For native DaemonSet, we use OnDelete strategy to enable manual pod deletion for batch control

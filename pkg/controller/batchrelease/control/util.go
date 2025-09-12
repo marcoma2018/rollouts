@@ -164,6 +164,20 @@ func GetOriginalSetting(object client.Object) (OriginalDeploymentStrategy, error
 	return setting, err
 }
 
+// GetOriginalDaemonSetSetting decode the strategy object for native DaemonSet
+// from the annotation "rollouts.kruise.io/original-deployment-strategy"
+// Only keeps updateStrategy.rollingUpdate.maxSurge and updateStrategy.rollingUpdate.maxUnavailable
+// Use OriginalDeploymentStrategy for native daemonSet for simplicity
+func GetOriginalDaemonSetSetting(object client.Object) (OriginalDeploymentStrategy, error) {
+	setting := OriginalDeploymentStrategy{}
+	settingStr := object.GetAnnotations()[v1beta1.OriginalDeploymentStrategyAnnotation]
+	if settingStr == "" {
+		return setting, nil
+	}
+	err := json.Unmarshal([]byte(settingStr), &setting)
+	return setting, err
+}
+
 // InitOriginalSetting will update the original setting based on the workload object
 // note: update the maxSurge and maxUnavailable only when MaxSurge and MaxUnavailable are nil,
 // which means they should keep unchanged in continuous release (though continuous release isn't supported for now)
@@ -213,6 +227,32 @@ func InitOriginalSetting(setting *OriginalDeploymentStrategy, object client.Obje
 	klog.InfoS("InitOriginalSetting: original setting updated", "object", object.GetName(), "changes", strings.Join(changeLogs, ";"))
 }
 
+// InitOriginalDaemonSetSetting will update the original setting for native DaemonSet based on the workload object
+// Only keeps updateStrategy.rollingUpdate.maxSurge and updateStrategy.rollingUpdate.maxUnavailable
+// Use OriginalDeploymentStrategy for native daemonSet for simplicity
+func InitOriginalDaemonSetSetting(setting *OriginalDeploymentStrategy, object client.Object) {
+	daemonSet, ok := object.(*apps.DaemonSet)
+	if !ok {
+		panic(fmt.Errorf("unsupported object type %T for InitOriginalDaemonSetSetting", object))
+	}
+
+	var changeLogs []string
+	if setting.MaxUnavailable == nil {
+		setting.MaxUnavailable = getMaxUnavailableFromNativeDaemonSet(daemonSet.Spec.UpdateStrategy.RollingUpdate)
+		changeLogs = append(changeLogs, fmt.Sprintf("maxUnavailable changed from nil to %s", setting.MaxUnavailable.String()))
+	}
+	if setting.MaxSurge == nil {
+		setting.MaxSurge = getMaxSurgeFromNativeDaemonSet(daemonSet.Spec.UpdateStrategy.RollingUpdate)
+		changeLogs = append(changeLogs, fmt.Sprintf("maxSurge changed from nil to %s", setting.MaxSurge.String()))
+	}
+
+	if len(changeLogs) == 0 {
+		klog.InfoS("InitOriginalDaemonSetSetting: original setting unchanged", "object", object.GetName())
+		return
+	}
+	klog.InfoS("InitOriginalDaemonSetSetting: original setting updated", "object", object.GetName(), "changes", strings.Join(changeLogs, ";"))
+}
+
 func getMaxSurgeFromDeployment(ru *apps.RollingUpdateDeployment) *intstr.IntOrString {
 	defaultMaxSurge := intstr.FromString("25%")
 	if ru == nil || ru.MaxSurge == nil {
@@ -241,6 +281,22 @@ func getMaxUnavailableFromCloneset(us appsv1alpha1.CloneSetUpdateStrategy) *ints
 		return &defaultMaxUnavailable
 	}
 	return us.MaxUnavailable
+}
+
+func getMaxUnavailableFromNativeDaemonSet(ru *apps.RollingUpdateDaemonSet) *intstr.IntOrString {
+	defaultMaxUnavailable := intstr.FromString("1")
+	if ru == nil || ru.MaxUnavailable == nil {
+		return &defaultMaxUnavailable
+	}
+	return ru.MaxUnavailable
+}
+
+func getMaxSurgeFromNativeDaemonSet(ru *apps.RollingUpdateDaemonSet) *intstr.IntOrString {
+	defaultMaxSurge := intstr.FromString("0")
+	if ru == nil || ru.MaxSurge == nil {
+		return &defaultMaxSurge
+	}
+	return ru.MaxSurge
 }
 
 func getIntPtrOrDefault(ptr *int32, defaultVal int32) *int32 {

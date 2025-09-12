@@ -18,13 +18,16 @@ package nativedaemonset
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"sort"
 
 	apps "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/openkruise/rollouts/api/v1beta1"
@@ -111,13 +114,20 @@ func (rc *realController) Initialize(release *v1beta1.BatchRelease) error {
 		return nil
 	}
 
+	// Save the original update strategy before modifying it
+	setting, err := control.GetOriginalDaemonSetSetting(rc.object)
+	if err != nil {
+		return fmt.Errorf("cannot get original setting for daemonset %v: %s", klog.KObj(rc.object), err.Error())
+	}
+	control.InitOriginalDaemonSetSetting(&setting, rc.object)
+
 	// For native DaemonSet, we set the update strategy to OnDelete to enable manual control
 	daemon := util.GetEmptyObjectWithKey(rc.object)
 	owner := control.BuildReleaseControlInfo(release)
 
 	// Set update strategy to OnDelete and add control annotations
-	body := fmt.Sprintf(`{"metadata":{"annotations":{"%s":"%s"}},"spec":{"updateStrategy":{"type":"OnDelete"}}}`,
-		util.BatchReleaseControlAnnotation, owner)
+	body := fmt.Sprintf(`{"metadata":{"annotations":{"%s":"%s","%s":"%s"}},"spec":{"updateStrategy":{"type":"OnDelete"}}}`,
+		util.BatchReleaseControlAnnotation, owner, v1beta1.OriginalDeploymentStrategyAnnotation, util.DumpJSON(&setting))
 
 	return rc.client.Patch(context.TODO(), daemon, client.RawPatch(types.MergePatchType, []byte(body)))
 }
@@ -178,6 +188,11 @@ func (rc *realController) UpgradeBatch(ctx *batchcontext.BatchContext) error {
 		}
 	}
 
+	// Sort pods by creation timestamp to delete oldest first (more predictable behavior)
+	sort.Slice(podsToDelete, func(i, j int) bool {
+		return podsToDelete[i].CreationTimestamp.Before(&podsToDelete[j].CreationTimestamp)
+	})
+
 	// Delete the required number of pods
 	for _, pod := range podsToDelete {
 		err := rc.client.Delete(context.TODO(), pod)
@@ -195,13 +210,32 @@ func (rc *realController) Finalize(release *v1beta1.BatchRelease) error {
 		return nil
 	}
 
-	var specBody string
-	// if batchPartition == nil, workload should be promoted to use RollingUpdate
-	if release.Spec.ReleasePlan.BatchPartition == nil {
-		specBody = `,"spec":{"updateStrategy":{"type":"RollingUpdate"}}`
+	// Restore the original setting and remove annotation
+	setting, err := control.GetOriginalDaemonSetSetting(rc.object)
+	if err != nil {
+		return err
 	}
 
-	body := fmt.Sprintf(`{"metadata":{"annotations":{"%s":null}}%s}`, util.BatchReleaseControlAnnotation, specBody)
+	var specBody string
+	// if batchPartition == nil, workload should be promoted to use the original update strategy
+	if release.Spec.ReleasePlan.BatchPartition == nil {
+		updateStrategy := apps.DaemonSetUpdateStrategy{
+			Type: apps.RollingUpdateDaemonSetStrategyType,
+		}
+		if setting.MaxUnavailable != nil || setting.MaxSurge != nil {
+			updateStrategy.RollingUpdate = &apps.RollingUpdateDaemonSet{}
+			if setting.MaxUnavailable != nil {
+				updateStrategy.RollingUpdate.MaxUnavailable = setting.MaxUnavailable
+			}
+			if setting.MaxSurge != nil {
+				updateStrategy.RollingUpdate.MaxSurge = setting.MaxSurge
+			}
+		}
+		strategyBytes, _ := json.Marshal(updateStrategy)
+		specBody = fmt.Sprintf(`,"spec":{"updateStrategy":%s}`, string(strategyBytes))
+	}
+
+	body := fmt.Sprintf(`{"metadata":{"annotations":{"%s":null,"%s":null},"labels":{"rollouts.kruise.io/stable-revision":null}}%s}`, util.BatchReleaseControlAnnotation, v1beta1.OriginalDeploymentStrategyAnnotation, specBody)
 
 	daemon := util.GetEmptyObjectWithKey(rc.object)
 	return rc.client.Patch(context.TODO(), daemon, client.RawPatch(types.MergePatchType, []byte(body)))
