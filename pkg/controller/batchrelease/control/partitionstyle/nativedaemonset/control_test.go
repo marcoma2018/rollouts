@@ -17,10 +17,13 @@ limitations under the License.
 package nativedaemonset
 
 import (
+	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/openkruise/rollouts/api/v1beta1"
-	"github.com/openkruise/rollouts/pkg/controller/batchrelease/context"
+	batchcontext "github.com/openkruise/rollouts/pkg/controller/batchrelease/context"
+	"github.com/openkruise/rollouts/pkg/controller/batchrelease/control"
 	"github.com/openkruise/rollouts/pkg/util"
 	"github.com/stretchr/testify/assert"
 	apps "k8s.io/api/apps/v1"
@@ -221,7 +224,7 @@ func TestUpgradeBatch(t *testing.T) {
 	controller := NewController(cli, key, gvk)
 	builtController, _ := controller.BuildController()
 
-	ctx := &context.BatchContext{
+	ctx := &batchcontext.BatchContext{
 		DesiredUpdatedReplicas: 2,
 		UpdateRevision:         "update-version",
 		Pods:                   []*corev1.Pod{},
@@ -311,7 +314,7 @@ func TestUpgradeBatchWithMaxUnavailable(t *testing.T) {
 	pods := []*corev1.Pod{pod1, pod2, pod3}
 	builtController.(*realController).pods = pods
 
-	ctx := &context.BatchContext{
+	ctx := &batchcontext.BatchContext{
 		DesiredUpdatedReplicas: 2,
 		UpdateRevision:         "update-version",
 		Pods:                   pods,
@@ -379,4 +382,143 @@ func TestCalculateBatchContextWithRollback(t *testing.T) {
 	// With rollback, we should have NoNeedUpdatedReplicas set
 	assert.NotNil(t, ctx.NoNeedUpdatedReplicas)
 	assert.Equal(t, int32(2), *ctx.NoNeedUpdatedReplicas)
+}
+
+// Additional tests for native DaemonSet specialized functions
+func TestInitializeWithOriginalStrategyAnnotation(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = apps.AddToScheme(scheme)
+	_ = v1beta1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	// Create a DaemonSet with existing original strategy annotation
+	existingSetting := control.OriginalDeploymentStrategy{
+		MaxUnavailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 2},
+		MaxSurge:       &intstr.IntOrString{Type: intstr.String, StrVal: "10%"},
+	}
+	settingBytes, _ := json.Marshal(existingSetting)
+
+	daemon := daemonDemo.DeepCopy()
+	daemon.Annotations[v1beta1.OriginalDeploymentStrategyAnnotation] = string(settingBytes)
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(daemon).Build()
+	key := types.NamespacedName{Name: "daemon-demo", Namespace: "default"}
+	gvk := schema.FromAPIVersionAndKind("apps/v1", "DaemonSet")
+
+	controller := NewController(cli, key, gvk)
+	builtController, _ := controller.BuildController()
+
+	err := builtController.Initialize(batchReleaseDemo)
+	assert.NoError(t, err)
+
+	// Verify the DaemonSet was updated correctly
+	updatedDaemon := &apps.DaemonSet{}
+	err = cli.Get(context.TODO(), key, updatedDaemon)
+	assert.NoError(t, err)
+
+	// Check that the update strategy is now OnDelete
+	assert.Equal(t, apps.OnDeleteDaemonSetStrategyType, updatedDaemon.Spec.UpdateStrategy.Type)
+
+	// Check that the original strategy annotation is preserved
+	assert.Contains(t, updatedDaemon.Annotations, v1beta1.OriginalDeploymentStrategyAnnotation)
+
+	// Parse and verify the original strategy
+	var savedSetting control.OriginalDeploymentStrategy
+	err = json.Unmarshal([]byte(updatedDaemon.Annotations[v1beta1.OriginalDeploymentStrategyAnnotation]), &savedSetting)
+	assert.NoError(t, err)
+	assert.Equal(t, int32(2), savedSetting.MaxUnavailable.IntVal)
+	assert.Equal(t, "10%", savedSetting.MaxSurge.StrVal)
+}
+
+func TestFinalizeWithBatchPartitionNil(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = apps.AddToScheme(scheme)
+	_ = v1beta1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	// Create a DaemonSet with original strategy annotation
+	existingSetting := control.OriginalDeploymentStrategy{
+		MaxUnavailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 3},
+		MaxSurge:       &intstr.IntOrString{Type: intstr.String, StrVal: "15%"},
+	}
+	settingBytes, _ := json.Marshal(existingSetting)
+
+	daemon := daemonDemo.DeepCopy()
+	daemon.Annotations[v1beta1.OriginalDeploymentStrategyAnnotation] = string(settingBytes)
+	// Set to OnDelete strategy to simulate initialized state
+	daemon.Spec.UpdateStrategy.Type = apps.OnDeleteDaemonSetStrategyType
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(daemon).Build()
+	key := types.NamespacedName{Name: "daemon-demo", Namespace: "default"}
+	gvk := schema.FromAPIVersionAndKind("apps/v1", "DaemonSet")
+
+	controller := NewController(cli, key, gvk)
+	builtController, _ := controller.BuildController()
+
+	// Create a batch release with nil BatchPartition (indicating completion)
+	completedBatchRelease := batchReleaseDemo.DeepCopy()
+	completedBatchRelease.Spec.ReleasePlan.BatchPartition = nil
+
+	err := builtController.Finalize(completedBatchRelease)
+	assert.NoError(t, err)
+
+	// Verify the DaemonSet was updated correctly
+	updatedDaemon := &apps.DaemonSet{}
+	err = cli.Get(context.TODO(), key, updatedDaemon)
+	assert.NoError(t, err)
+
+	// Check that the update strategy is restored to RollingUpdate
+	assert.Equal(t, apps.RollingUpdateDaemonSetStrategyType, updatedDaemon.Spec.UpdateStrategy.Type)
+	assert.NotNil(t, updatedDaemon.Spec.UpdateStrategy.RollingUpdate)
+	assert.Equal(t, int32(3), updatedDaemon.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable.IntVal)
+	assert.Equal(t, "15%", updatedDaemon.Spec.UpdateStrategy.RollingUpdate.MaxSurge.StrVal)
+
+	// Check that annotations are removed
+	assert.NotContains(t, updatedDaemon.Annotations, util.BatchReleaseControlAnnotation)
+	assert.NotContains(t, updatedDaemon.Annotations, v1beta1.OriginalDeploymentStrategyAnnotation)
+}
+
+func TestFinalizeWithBatchPartitionNotNil(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = apps.AddToScheme(scheme)
+	_ = v1beta1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	// Create a DaemonSet with original strategy annotation
+	existingSetting := control.OriginalDeploymentStrategy{
+		MaxUnavailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
+		MaxSurge:       &intstr.IntOrString{Type: intstr.String, StrVal: "5%"},
+	}
+	settingBytes, _ := json.Marshal(existingSetting)
+
+	daemon := daemonDemo.DeepCopy()
+	daemon.Annotations[v1beta1.OriginalDeploymentStrategyAnnotation] = string(settingBytes)
+	// Set to OnDelete strategy to simulate initialized state
+	daemon.Spec.UpdateStrategy.Type = apps.OnDeleteDaemonSetStrategyType
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(daemon).Build()
+	key := types.NamespacedName{Name: "daemon-demo", Namespace: "default"}
+	gvk := schema.FromAPIVersionAndKind("apps/v1", "DaemonSet")
+
+	controller := NewController(cli, key, gvk)
+	builtController, _ := controller.BuildController()
+
+	// Create a batch release with non-nil BatchPartition (indicating in-progress)
+	inProgressBatchRelease := batchReleaseDemo.DeepCopy()
+	batchPartition := int32(1)
+	inProgressBatchRelease.Spec.ReleasePlan.BatchPartition = &batchPartition
+
+	err := builtController.Finalize(inProgressBatchRelease)
+	assert.NoError(t, err)
+
+	// Verify the DaemonSet was updated correctly
+	updatedDaemon := &apps.DaemonSet{}
+	err = cli.Get(context.TODO(), key, updatedDaemon)
+	assert.NoError(t, err)
+
+	// Check that annotations are removed but update strategy is not changed
+	assert.NotContains(t, updatedDaemon.Annotations, util.BatchReleaseControlAnnotation)
+	assert.NotContains(t, updatedDaemon.Annotations, v1beta1.OriginalDeploymentStrategyAnnotation)
+	// Update strategy should remain OnDelete since batch is not complete
+	assert.Equal(t, apps.OnDeleteDaemonSetStrategyType, updatedDaemon.Spec.UpdateStrategy.Type)
 }

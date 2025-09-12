@@ -202,16 +202,165 @@ func TestIsCurrentMoreThanOrEqualToDesired(t *testing.T) {
 			desired: intstr.FromString("80%"),
 			result:  true,
 		},
-		"current=90%,desired=91%": {
-			current: intstr.FromString("90%"),
-			desired: intstr.FromString("91%"),
+		"current=80%,desired=81%": {
+			current: intstr.FromString("80%"),
+			desired: intstr.FromString("81%"),
 			result:  false,
 		},
 	}
+
 	for name, cs := range cases {
 		t.Run(name, func(t *testing.T) {
 			got := IsCurrentMoreThanOrEqualToDesired(cs.current, cs.desired)
-			Expect(got == cs.result).Should(BeTrue())
+			Expect(got).Should(Equal(cs.result))
 		})
 	}
+}
+
+// Tests for native DaemonSet specialized functions
+func TestGetOriginalDaemonSetSetting(t *testing.T) {
+	RegisterFailHandler(Fail)
+
+	// Test case 1: DaemonSet with no annotation
+	daemonSetWithoutAnnotation := &apps.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "test-daemonset",
+			Namespace:   "default",
+			Annotations: map[string]string{},
+		},
+	}
+
+	setting, err := GetOriginalDaemonSetSetting(daemonSetWithoutAnnotation)
+	Expect(err).ShouldNot(HaveOccurred())
+	Expect(setting).Should(Equal(OriginalDeploymentStrategy{}))
+
+	// Test case 2: DaemonSet with valid annotation
+	expectedSetting := OriginalDeploymentStrategy{
+		MaxUnavailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
+		MaxSurge:       &intstr.IntOrString{Type: intstr.String, StrVal: "10%"},
+	}
+	settingBytes, _ := json.Marshal(expectedSetting)
+	daemonSetWithAnnotation := &apps.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-daemonset",
+			Namespace: "default",
+			Annotations: map[string]string{
+				v1beta1.OriginalDeploymentStrategyAnnotation: string(settingBytes),
+			},
+		},
+	}
+
+	setting, err = GetOriginalDaemonSetSetting(daemonSetWithAnnotation)
+	Expect(err).ShouldNot(HaveOccurred())
+	Expect(*setting.MaxUnavailable).Should(Equal(*expectedSetting.MaxUnavailable))
+	Expect(*setting.MaxSurge).Should(Equal(*expectedSetting.MaxSurge))
+}
+
+func TestInitOriginalDaemonSetSetting(t *testing.T) {
+	RegisterFailHandler(Fail)
+
+	// Test case 1: Unsupported object type should panic
+	deployment := &apps.Deployment{}
+	Expect(func() {
+		setting := OriginalDeploymentStrategy{}
+		InitOriginalDaemonSetSetting(&setting, deployment)
+	}).Should(Panic())
+
+	// Test case 2: DaemonSet with nil MaxUnavailable and MaxSurge should set defaults
+	daemonSet := &apps.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-daemonset",
+			Namespace: "default",
+		},
+		Spec: apps.DaemonSetSpec{
+			UpdateStrategy: apps.DaemonSetUpdateStrategy{
+				Type:          apps.RollingUpdateDaemonSetStrategyType,
+				RollingUpdate: &apps.RollingUpdateDaemonSet{},
+			},
+		},
+	}
+
+	setting := OriginalDeploymentStrategy{}
+	InitOriginalDaemonSetSetting(&setting, daemonSet)
+	Expect(setting.MaxUnavailable).ShouldNot(BeNil())
+	Expect(setting.MaxSurge).ShouldNot(BeNil())
+	Expect(setting.MaxUnavailable.String()).Should(Equal("1"))
+	Expect(setting.MaxSurge.String()).Should(Equal("0"))
+
+	// Test case 3: DaemonSet with existing MaxUnavailable and MaxSurge should not overwrite
+	existingMaxUnavailable := intstr.FromInt(3)
+	existingMaxSurge := intstr.FromString("20%")
+	setting = OriginalDeploymentStrategy{
+		MaxUnavailable: &existingMaxUnavailable,
+		MaxSurge:       &existingMaxSurge,
+	}
+	InitOriginalDaemonSetSetting(&setting, daemonSet)
+	Expect(setting.MaxUnavailable.String()).Should(Equal("3"))
+	Expect(setting.MaxSurge.String()).Should(Equal("20%"))
+
+	// Test case 4: DaemonSet with specific MaxUnavailable and MaxSurge values
+	specificMaxUnavailable := intstr.FromInt(2)
+	specificMaxSurge := intstr.FromString("15%")
+	daemonSetWithValues := &apps.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-daemonset",
+			Namespace: "default",
+		},
+		Spec: apps.DaemonSetSpec{
+			UpdateStrategy: apps.DaemonSetUpdateStrategy{
+				Type: apps.RollingUpdateDaemonSetStrategyType,
+				RollingUpdate: &apps.RollingUpdateDaemonSet{
+					MaxUnavailable: &specificMaxUnavailable,
+					MaxSurge:       &specificMaxSurge,
+				},
+			},
+		},
+	}
+
+	setting = OriginalDeploymentStrategy{}
+	InitOriginalDaemonSetSetting(&setting, daemonSetWithValues)
+	Expect(setting.MaxUnavailable.String()).Should(Equal("2"))
+	Expect(setting.MaxSurge.String()).Should(Equal("15%"))
+}
+
+func TestGetMaxSurgeFromNativeDaemonSet(t *testing.T) {
+	RegisterFailHandler(Fail)
+
+	// Test case 1: nil RollingUpdateDaemonSet should return default
+	result := getMaxSurgeFromNativeDaemonSet(nil)
+	Expect(result.String()).Should(Equal("0"))
+
+	// Test case 2: RollingUpdateDaemonSet with nil MaxSurge should return default
+	ru := &apps.RollingUpdateDaemonSet{}
+	result = getMaxSurgeFromNativeDaemonSet(ru)
+	Expect(result.String()).Should(Equal("0"))
+
+	// Test case 3: RollingUpdateDaemonSet with MaxSurge should return the value
+	maxSurge := intstr.FromString("10%")
+	ru = &apps.RollingUpdateDaemonSet{
+		MaxSurge: &maxSurge,
+	}
+	result = getMaxSurgeFromNativeDaemonSet(ru)
+	Expect(result.String()).Should(Equal("10%"))
+}
+
+func TestGetMaxUnavailableFromNativeDaemonSet(t *testing.T) {
+	RegisterFailHandler(Fail)
+
+	// Test case 1: nil RollingUpdateDaemonSet should return default
+	result := getMaxUnavailableFromNativeDaemonSet(nil)
+	Expect(result.String()).Should(Equal("1"))
+
+	// Test case 2: RollingUpdateDaemonSet with nil MaxUnavailable should return default
+	ru := &apps.RollingUpdateDaemonSet{}
+	result = getMaxUnavailableFromNativeDaemonSet(ru)
+	Expect(result.String()).Should(Equal("1"))
+
+	// Test case 3: RollingUpdateDaemonSet with MaxUnavailable should return the value
+	maxUnavailable := intstr.FromString("20%")
+	ru = &apps.RollingUpdateDaemonSet{
+		MaxUnavailable: &maxUnavailable,
+	}
+	result = getMaxUnavailableFromNativeDaemonSet(ru)
+	Expect(result.String()).Should(Equal("20%"))
 }
