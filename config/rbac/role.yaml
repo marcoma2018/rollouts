@@ -107,8 +107,6 @@ rules:
   resources:
   - daemonsets
   verbs:
-  - create
-  - delete
   - get
   - list
   - patch

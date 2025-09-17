@@ -29,6 +29,7 @@ import (
 // +kubebuilder:webhook:path=/mutate-apps-v1-daemonset,mutating=true,failurePolicy=fail,sideEffects=None,admissionReviewVersions=v1;v1beta1,groups=apps,resources=daemonsets,verbs=update,versions=v1,name=mdaemonset-native.kb.io
 // +kubebuilder:webhook:path=/mutate-apps-v1-deployment,mutating=true,failurePolicy=fail,sideEffects=None,admissionReviewVersions=v1;v1beta1,groups=apps,resources=deployments,verbs=update,versions=v1,name=mdeployment.kb.io
 // +kubebuilder:webhook:path=/mutate-unified-workload,mutating=true,failurePolicy=fail,sideEffects=None,admissionReviewVersions=v1;v1beta1,groups=*,resources=*,verbs=create;update,versions=*,name=munifiedworload.kb.io
+// +kubebuilder:webhook:path=/mutate-pod-for-daemonset-rollout,mutating=true,failurePolicy=ignore,sideEffects=None,admissionReviewVersions=v1;v1beta1,groups="",resources=pods,verbs=create,versions=v1,name=mpoddaemonsetrollout.kb.io
 
 var (
 	// HandlerMap contains admission webhook handlers
@@ -53,6 +54,10 @@ var (
 		"mutate-unified-workload": func(mgr manager.Manager) admission.Handler {
 			decoder := admission.NewDecoder(mgr.GetScheme())
 			return &UnifiedWorkloadHandler{Decoder: decoder, Client: mgr.GetClient(), Finder: util.NewControllerFinder(mgr.GetClient())}
+		},
+		"mutate-pod-for-daemonset-rollout": func(mgr manager.Manager) admission.Handler {
+			decoder := admission.NewDecoder(mgr.GetScheme())
+			return &PodCreateHandler{Decoder: decoder, Client: mgr.GetClient()}
 		},
 	}
 )

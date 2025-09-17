@@ -18,12 +18,10 @@ package nativedaemonset
 
 import (
 	"context"
-	"encoding/json"
 	"testing"
 
 	"github.com/openkruise/rollouts/api/v1beta1"
 	batchcontext "github.com/openkruise/rollouts/pkg/controller/batchrelease/context"
-	"github.com/openkruise/rollouts/pkg/controller/batchrelease/control"
 	"github.com/openkruise/rollouts/pkg/util"
 	"github.com/stretchr/testify/assert"
 	apps "k8s.io/api/apps/v1"
@@ -251,8 +249,7 @@ func TestUpgradeBatchWithMaxUnavailable(t *testing.T) {
 			Name:      "pod-1",
 			Namespace: "default",
 			Labels: map[string]string{
-				"app":                                "daemon-demo",
-				apps.DefaultDeploymentUniqueLabelKey: "old-version",
+				"app": "daemon-demo",
 			},
 		},
 		Spec: corev1.PodSpec{
@@ -270,8 +267,7 @@ func TestUpgradeBatchWithMaxUnavailable(t *testing.T) {
 			Name:      "pod-2",
 			Namespace: "default",
 			Labels: map[string]string{
-				"app":                                "daemon-demo",
-				apps.DefaultDeploymentUniqueLabelKey: "old-version",
+				"app": "daemon-demo",
 			},
 		},
 		Spec: corev1.PodSpec{
@@ -289,8 +285,7 @@ func TestUpgradeBatchWithMaxUnavailable(t *testing.T) {
 			Name:      "pod-3",
 			Namespace: "default",
 			Labels: map[string]string{
-				"app":                                "daemon-demo",
-				apps.DefaultDeploymentUniqueLabelKey: "old-version",
+				"app": "daemon-demo",
 			},
 		},
 		Spec: corev1.PodSpec{
@@ -325,6 +320,165 @@ func TestUpgradeBatchWithMaxUnavailable(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+func TestUpgradeBatchWithPodsWithTemplateHash(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = apps.AddToScheme(scheme)
+	_ = v1beta1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	daemon := daemonDemo.DeepCopy()
+	// Set maxUnavailable to 2 for this test
+	maxUnavailable := intstr.FromInt(2)
+	daemon.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable = &maxUnavailable
+
+	// Create some pods for testing - some with pod-template-hash, some without
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-1",
+			Namespace: "default",
+			Labels: map[string]string{
+				"app":               "daemon-demo",
+				"pod-template-hash": "old-version",
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  "main",
+					Image: "nginx:latest",
+				},
+			},
+		},
+	}
+
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-2",
+			Namespace: "default",
+			Labels: map[string]string{
+				"app": "daemon-demo",
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  "main",
+					Image: "nginx:latest",
+				},
+			},
+		},
+	}
+
+	pod3 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-3",
+			Namespace: "default",
+			Labels: map[string]string{
+				"app": "daemon-demo",
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  "main",
+					Image: "nginx:latest",
+				},
+			},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(daemon, pod1, pod2, pod3).Build()
+	key := types.NamespacedName{Name: "daemon-demo", Namespace: "default"}
+	gvk := schema.FromAPIVersionAndKind("apps/v1", "DaemonSet")
+
+	controller := NewController(cli, key, gvk)
+	builtController, _ := controller.BuildController()
+
+	// Set up the pods in the controller
+	pods := []*corev1.Pod{pod1, pod2, pod3}
+	builtController.(*realController).pods = pods
+
+	ctx := &batchcontext.BatchContext{
+		DesiredUpdatedReplicas: 2,
+		UpdateRevision:         "update-version",
+		Pods:                   pods,
+		Replicas:               5,
+	}
+
+	err := builtController.UpgradeBatch(ctx)
+	assert.NoError(t, err)
+}
+
+func TestUpgradeBatchWithPodsBeingDeleted(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = apps.AddToScheme(scheme)
+	_ = v1beta1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	daemon := daemonDemo.DeepCopy()
+
+	// Create some pods for testing - one being deleted
+	now := metav1.Now()
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "pod-1",
+			Namespace:         "default",
+			DeletionTimestamp: &now,
+			Finalizers:        []string{"test-finalizer"},
+			Labels: map[string]string{
+				"app": "daemon-demo",
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  "main",
+					Image: "nginx:latest",
+				},
+			},
+		},
+	}
+
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-2",
+			Namespace: "default",
+			Labels: map[string]string{
+				"app": "daemon-demo",
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  "main",
+					Image: "nginx:latest",
+				},
+			},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(daemon).WithObjects(pod1, pod2).Build()
+	key := types.NamespacedName{Name: "daemon-demo", Namespace: "default"}
+	gvk := schema.FromAPIVersionAndKind("apps/v1", "DaemonSet")
+
+	controller := NewController(cli, key, gvk)
+	builtController, _ := controller.BuildController()
+
+	// Set up the pods in the controller by listing them
+	pods, _ := builtController.ListOwnedPods()
+	builtController.(*realController).pods = pods
+
+	ctx := &batchcontext.BatchContext{
+		DesiredUpdatedReplicas: 2,
+		UpdateRevision:         "update-version",
+		Pods:                   pods,
+		Replicas:               5,
+	}
+
+	err := builtController.UpgradeBatch(ctx)
+	assert.NoError(t, err)
+}
+
 func TestFinalize(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = apps.AddToScheme(scheme)
@@ -340,6 +494,217 @@ func TestFinalize(t *testing.T) {
 	builtController, _ := controller.BuildController()
 
 	err := builtController.Finalize(batchReleaseDemo)
+	assert.NoError(t, err)
+}
+
+func TestFinalizeWithPodTemplateHashCleanup(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = apps.AddToScheme(scheme)
+	_ = v1beta1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	daemon := daemonDemo.DeepCopy()
+	// Set to OnDelete strategy to simulate initialized state
+	daemon.Spec.UpdateStrategy.Type = apps.OnDeleteDaemonSetStrategyType
+
+	// Create pods with pod-template-hash labels
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-1",
+			Namespace: "default",
+			Labels: map[string]string{
+				"app":               "daemon-demo",
+				"pod-template-hash": "old-version",
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  "main",
+					Image: "nginx:latest",
+				},
+			},
+		},
+	}
+
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-2",
+			Namespace: "default",
+			Labels: map[string]string{
+				"app": "daemon-demo",
+				// No pod-template-hash label
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  "main",
+					Image: "nginx:latest",
+				},
+			},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(daemon, pod1, pod2).Build()
+	key := types.NamespacedName{Name: "daemon-demo", Namespace: "default"}
+	gvk := schema.FromAPIVersionAndKind("apps/v1", "DaemonSet")
+
+	controller := NewController(cli, key, gvk)
+	builtController, _ := controller.BuildController()
+
+	// Set up the pods in the controller
+	pods := []*corev1.Pod{pod1, pod2}
+	builtController.(*realController).pods = pods
+
+	// Create a batch release with nil BatchPartition (indicating completion)
+	completedBatchRelease := batchReleaseDemo.DeepCopy()
+	completedBatchRelease.Spec.ReleasePlan.BatchPartition = nil
+
+	err := builtController.Finalize(completedBatchRelease)
+	assert.NoError(t, err)
+
+	// Verify the pods were updated correctly
+	updatedPod1 := &corev1.Pod{}
+	err = cli.Get(context.TODO(), types.NamespacedName{Name: "pod-1", Namespace: "default"}, updatedPod1)
+	assert.NoError(t, err)
+
+	// Check that the pod-template-hash label was removed from pod1
+	assert.NotContains(t, updatedPod1.Labels, "pod-template-hash")
+
+	// Verify the DaemonSet was updated correctly
+	updatedDaemon := &apps.DaemonSet{}
+	err = cli.Get(context.TODO(), key, updatedDaemon)
+	assert.NoError(t, err)
+
+	// Check that the update strategy is restored to RollingUpdate
+	assert.Equal(t, apps.RollingUpdateDaemonSetStrategyType, updatedDaemon.Spec.UpdateStrategy.Type)
+
+	// Check that control annotation is removed
+	assert.NotContains(t, updatedDaemon.Annotations, util.BatchReleaseControlAnnotation)
+}
+
+func TestCleanupPodTemplateHashLabels(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = apps.AddToScheme(scheme)
+	_ = v1beta1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	daemon := daemonDemo.DeepCopy()
+
+	// Create pods with pod-template-hash labels
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-1",
+			Namespace: "default",
+			Labels: map[string]string{
+				"app":               "daemon-demo",
+				"pod-template-hash": "old-version",
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  "main",
+					Image: "nginx:latest",
+				},
+			},
+		},
+	}
+
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-2",
+			Namespace: "default",
+			Labels: map[string]string{
+				"app": "daemon-demo",
+				// No pod-template-hash label
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  "main",
+					Image: "nginx:latest",
+				},
+			},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(daemon, pod1, pod2).Build()
+	key := types.NamespacedName{Name: "daemon-demo", Namespace: "default"}
+	gvk := schema.FromAPIVersionAndKind("apps/v1", "DaemonSet")
+
+	controller := NewController(cli, key, gvk)
+	builtController, _ := controller.BuildController()
+
+	// Set up the pods in the controller
+	pods := []*corev1.Pod{pod1, pod2}
+	builtController.(*realController).pods = pods
+
+	// Call the cleanup function directly
+	err := builtController.(*realController).cleanupPodTemplateHashLabels()
+	assert.NoError(t, err)
+
+	// Verify the pods were updated correctly
+	updatedPod1 := &corev1.Pod{}
+	err = cli.Get(context.TODO(), types.NamespacedName{Name: "pod-1", Namespace: "default"}, updatedPod1)
+	assert.NoError(t, err)
+
+	// Check that the pod-template-hash label was removed from pod1
+	assert.NotContains(t, updatedPod1.Labels, "pod-template-hash")
+
+	// Verify pod2 was not changed (it didn't have the label)
+	updatedPod2 := &corev1.Pod{}
+	err = cli.Get(context.TODO(), types.NamespacedName{Name: "pod-2", Namespace: "default"}, updatedPod2)
+	assert.NoError(t, err)
+	assert.NotContains(t, updatedPod2.Labels, "pod-template-hash")
+}
+
+func TestCleanupPodTemplateHashLabelsErrorHandling(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = apps.AddToScheme(scheme)
+	_ = v1beta1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	daemon := daemonDemo.DeepCopy()
+
+	// Create a pod with pod-template-hash label
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-1",
+			Namespace: "default",
+			Labels: map[string]string{
+				"app":               "daemon-demo",
+				"pod-template-hash": "old-version",
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  "main",
+					Image: "nginx:latest",
+				},
+			},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(daemon, pod1).Build()
+	key := types.NamespacedName{Name: "daemon-demo", Namespace: "default"}
+	gvk := schema.FromAPIVersionAndKind("apps/v1", "DaemonSet")
+
+	controller := NewController(cli, key, gvk)
+	builtController, _ := controller.BuildController()
+
+	// Set up the pods in the controller
+	pods := []*corev1.Pod{pod1}
+	builtController.(*realController).pods = pods
+
+	// Delete the pod to simulate a NotFound error
+	cli.Delete(context.TODO(), pod1)
+
+	// Call the cleanup function directly - should handle NotFound error gracefully
+	err := builtController.(*realController).cleanupPodTemplateHashLabels()
 	assert.NoError(t, err)
 }
 
@@ -391,15 +756,7 @@ func TestInitializeWithOriginalStrategyAnnotation(t *testing.T) {
 	_ = v1beta1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
 
-	// Create a DaemonSet with existing original strategy annotation
-	existingSetting := control.OriginalDeploymentStrategy{
-		MaxUnavailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 2},
-		MaxSurge:       &intstr.IntOrString{Type: intstr.String, StrVal: "10%"},
-	}
-	settingBytes, _ := json.Marshal(existingSetting)
-
 	daemon := daemonDemo.DeepCopy()
-	daemon.Annotations[v1beta1.OriginalDeploymentStrategyAnnotation] = string(settingBytes)
 
 	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(daemon).Build()
 	key := types.NamespacedName{Name: "daemon-demo", Namespace: "default"}
@@ -419,15 +776,8 @@ func TestInitializeWithOriginalStrategyAnnotation(t *testing.T) {
 	// Check that the update strategy is now OnDelete
 	assert.Equal(t, apps.OnDeleteDaemonSetStrategyType, updatedDaemon.Spec.UpdateStrategy.Type)
 
-	// Check that the original strategy annotation is preserved
-	assert.Contains(t, updatedDaemon.Annotations, v1beta1.OriginalDeploymentStrategyAnnotation)
-
-	// Parse and verify the original strategy
-	var savedSetting control.OriginalDeploymentStrategy
-	err = json.Unmarshal([]byte(updatedDaemon.Annotations[v1beta1.OriginalDeploymentStrategyAnnotation]), &savedSetting)
-	assert.NoError(t, err)
-	assert.Equal(t, int32(2), savedSetting.MaxUnavailable.IntVal)
-	assert.Equal(t, "10%", savedSetting.MaxSurge.StrVal)
+	// Check that the control annotation is set
+	assert.Contains(t, updatedDaemon.Annotations, util.BatchReleaseControlAnnotation)
 }
 
 func TestFinalizeWithBatchPartitionNil(t *testing.T) {
@@ -436,15 +786,7 @@ func TestFinalizeWithBatchPartitionNil(t *testing.T) {
 	_ = v1beta1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
 
-	// Create a DaemonSet with original strategy annotation
-	existingSetting := control.OriginalDeploymentStrategy{
-		MaxUnavailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 3},
-		MaxSurge:       &intstr.IntOrString{Type: intstr.String, StrVal: "15%"},
-	}
-	settingBytes, _ := json.Marshal(existingSetting)
-
 	daemon := daemonDemo.DeepCopy()
-	daemon.Annotations[v1beta1.OriginalDeploymentStrategyAnnotation] = string(settingBytes)
 	// Set to OnDelete strategy to simulate initialized state
 	daemon.Spec.UpdateStrategy.Type = apps.OnDeleteDaemonSetStrategyType
 
@@ -469,13 +811,9 @@ func TestFinalizeWithBatchPartitionNil(t *testing.T) {
 
 	// Check that the update strategy is restored to RollingUpdate
 	assert.Equal(t, apps.RollingUpdateDaemonSetStrategyType, updatedDaemon.Spec.UpdateStrategy.Type)
-	assert.NotNil(t, updatedDaemon.Spec.UpdateStrategy.RollingUpdate)
-	assert.Equal(t, int32(3), updatedDaemon.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable.IntVal)
-	assert.Equal(t, "15%", updatedDaemon.Spec.UpdateStrategy.RollingUpdate.MaxSurge.StrVal)
 
 	// Check that annotations are removed
 	assert.NotContains(t, updatedDaemon.Annotations, util.BatchReleaseControlAnnotation)
-	assert.NotContains(t, updatedDaemon.Annotations, v1beta1.OriginalDeploymentStrategyAnnotation)
 }
 
 func TestFinalizeWithBatchPartitionNotNil(t *testing.T) {
@@ -484,15 +822,7 @@ func TestFinalizeWithBatchPartitionNotNil(t *testing.T) {
 	_ = v1beta1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
 
-	// Create a DaemonSet with original strategy annotation
-	existingSetting := control.OriginalDeploymentStrategy{
-		MaxUnavailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
-		MaxSurge:       &intstr.IntOrString{Type: intstr.String, StrVal: "5%"},
-	}
-	settingBytes, _ := json.Marshal(existingSetting)
-
 	daemon := daemonDemo.DeepCopy()
-	daemon.Annotations[v1beta1.OriginalDeploymentStrategyAnnotation] = string(settingBytes)
 	// Set to OnDelete strategy to simulate initialized state
 	daemon.Spec.UpdateStrategy.Type = apps.OnDeleteDaemonSetStrategyType
 
@@ -516,9 +846,8 @@ func TestFinalizeWithBatchPartitionNotNil(t *testing.T) {
 	err = cli.Get(context.TODO(), key, updatedDaemon)
 	assert.NoError(t, err)
 
-	// Check that annotations are removed but update strategy is not changed
+	// Check that control annotation is removed
 	assert.NotContains(t, updatedDaemon.Annotations, util.BatchReleaseControlAnnotation)
-	assert.NotContains(t, updatedDaemon.Annotations, v1beta1.OriginalDeploymentStrategyAnnotation)
 	// Update strategy should remain OnDelete since batch is not complete
 	assert.Equal(t, apps.OnDeleteDaemonSetStrategyType, updatedDaemon.Spec.UpdateStrategy.Type)
 }

@@ -20,6 +20,7 @@ import (
 	"context"
 	"strings"
 
+	apps "k8s.io/api/apps/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -70,13 +71,26 @@ func GetPodConditionFromList(conditions []v1.PodCondition, conditionType v1.PodC
 
 // IsConsistentWithRevision return true if pod is match the revision
 func IsConsistentWithRevision(labels map[string]string, revision string) bool {
-	if labels[appsv1.DefaultDeploymentUniqueLabelKey] != "" &&
-		strings.HasSuffix(revision, labels[appsv1.DefaultDeploymentUniqueLabelKey]) {
+	// First check the default deployment unique label key (pod-template-hash)
+	if labels[apps.DefaultDeploymentUniqueLabelKey] != "" &&
+		labels[apps.DefaultDeploymentUniqueLabelKey] == revision {
 		return true
 	}
 
-	if labels[appsv1.ControllerRevisionHashLabelKey] != "" &&
-		strings.HasSuffix(revision, labels[appsv1.ControllerRevisionHashLabelKey]) {
+	// Also check the controller revision hash label key for completeness
+	if labels[apps.ControllerRevisionHashLabelKey] != "" &&
+		labels[apps.ControllerRevisionHashLabelKey] == revision {
+		return true
+	}
+
+	// Check if the revision is a suffix of the label value (for partial matches)
+	if labels[apps.DefaultDeploymentUniqueLabelKey] != "" &&
+		strings.HasSuffix(revision, labels[apps.DefaultDeploymentUniqueLabelKey]) {
+		return true
+	}
+
+	if labels[apps.ControllerRevisionHashLabelKey] != "" &&
+		strings.HasSuffix(revision, labels[apps.ControllerRevisionHashLabelKey]) {
 		return true
 	}
 	return false

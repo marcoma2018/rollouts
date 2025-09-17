@@ -1,19 +1,3 @@
-/*
-Copyright 2022 The Kruise Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package nativedaemonset
 
 import (
@@ -21,9 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
+	"time"
 
 	apps "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -86,6 +73,7 @@ func (rc *realController) BuildController() (partitionstyle.Interface, error) {
 			if !pod.DeletionTimestamp.IsZero() {
 				return false
 			}
+			// Use rc.WorkloadInfo.Status.UpdateRevision for consistency
 			if !util.IsConsistentWithRevision(pod.GetLabels(), rc.WorkloadInfo.Status.UpdateRevision) {
 				return false
 			}
@@ -97,7 +85,6 @@ func (rc *realController) BuildController() (partitionstyle.Interface, error) {
 }
 
 // ListOwnedPods fetch the pods owned by the workload.
-// Note that we should list pod only if we really need it.
 func (rc *realController) ListOwnedPods() ([]*corev1.Pod, error) {
 	if rc.pods != nil {
 		return rc.pods, nil
@@ -108,51 +95,94 @@ func (rc *realController) ListOwnedPods() ([]*corev1.Pod, error) {
 }
 
 // Initialize prepares the native DaemonSet for batch release by setting the appropriate update strategy.
-// For native DaemonSet, we'll use OnDelete strategy to enable manual pod deletion for batch control.
 func (rc *realController) Initialize(release *v1beta1.BatchRelease) error {
 	if control.IsControlledByBatchRelease(release, rc.object) {
 		return nil
 	}
 
-	// Save the original update strategy before modifying it
-	setting, err := control.GetOriginalDaemonSetSetting(rc.object)
-	if err != nil {
-		return fmt.Errorf("cannot get original setting for daemonset %v: %s", klog.KObj(rc.object), err.Error())
-	}
-	control.InitOriginalDaemonSetSetting(&setting, rc.object)
-
 	// For native DaemonSet, we set the update strategy to OnDelete to enable manual control
 	daemon := util.GetEmptyObjectWithKey(rc.object)
 	owner := control.BuildReleaseControlInfo(release)
 
-	// Set update strategy to OnDelete and add control annotations
-	body := fmt.Sprintf(`{"metadata":{"annotations":{"%s":"%s","%s":"%s"}},"spec":{"updateStrategy":{"type":"OnDelete"}}}`,
-		util.BatchReleaseControlAnnotation, owner, v1beta1.OriginalDeploymentStrategyAnnotation, util.DumpJSON(&setting))
+	unescapedOwner, err := strconv.Unquote(`"` + owner + `"`)
+	if err != nil {
+		return fmt.Errorf("failed to unescape owner info: %v", err)
+	}
 
-	return rc.client.Patch(context.TODO(), daemon, client.RawPatch(types.MergePatchType, []byte(body)))
+	// Create a proper JSON patch using map structure to avoid escaping issues
+	patch := map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"annotations": map[string]interface{}{
+				util.BatchReleaseControlAnnotation: unescapedOwner,
+			},
+		},
+		"spec": map[string]interface{}{
+			"updateStrategy": map[string]interface{}{
+				"type": "OnDelete",
+			},
+		},
+	}
+
+	patchBytes, err := json.Marshal(patch)
+	if err != nil {
+		return fmt.Errorf("failed to marshal patch: %v", err)
+	}
+
+	return rc.client.Patch(context.TODO(), daemon, client.RawPatch(types.MergePatchType, patchBytes))
 }
 
 // UpgradeBatch handles the batch upgrade for native DaemonSet by deleting pods in the current batch.
-// Since native DaemonSet uses OnDelete strategy, we need to manually delete pods to trigger updates.
 func (rc *realController) UpgradeBatch(ctx *batchcontext.BatchContext) error {
-	// For native DaemonSet with OnDelete strategy, we delete pods to trigger updates
-	// Calculate how many pods need to be deleted based on the desired partition
+	// Force refresh pods to get the latest state from API server
+	latestPods, err := rc.ListOwnedPods()
+	if err != nil {
+		klog.Errorf("Failed to list owned pods: %v", err)
+		return err
+	}
 
-	// Get the current number of updated pods
-	currentUpdated := rc.Status.UpdatedReplicas
+	// Update the context with the latest pods
+	ctx.Pods = latestPods
 
-	// Calculate desired number of updated pods for this batch
-	desiredUpdated := ctx.DesiredUpdatedReplicas
+	// Step 1: Check if there are pods being deleted, if so, exit immediately
+	podsBeingDeleted := int32(0)
+	for _, pod := range ctx.Pods {
+		if !pod.DeletionTimestamp.IsZero() {
+			podsBeingDeleted++
+		}
+	}
 
-	// If we already have enough updated pods, no need to delete more
-	if currentUpdated >= desiredUpdated {
+	if podsBeingDeleted > 0 {
+		klog.Infof("Found %d pods being deleted, skipping this reconcile", podsBeingDeleted)
 		return nil
 	}
 
-	// Calculate how many pods we need to delete to reach desired state
-	needToDelete := desiredUpdated - currentUpdated
+	// Step 2: Check if the number of updated pods has reached the target
+	updatedPods := int32(0)
+	var podsToDelete []*corev1.Pod
 
-	// Respect maxUnavailable setting from user
+	for _, pod := range ctx.Pods {
+		// Check if pod has pod-template-hash label (indicating it's updated)
+		if _, hasTemplateHash := pod.Labels["pod-template-hash"]; hasTemplateHash {
+			updatedPods++
+			klog.Infof("Pod %s/%s has pod-template-hash, counting as updated", pod.Namespace, pod.Name)
+		} else {
+			// Pods without pod-template-hash need to be deleted
+			podsToDelete = append(podsToDelete, pod)
+		}
+	}
+
+	if updatedPods >= ctx.DesiredUpdatedReplicas {
+		klog.Infof("Already have enough updated pods: %d >= %d, skipping deletion", updatedPods, ctx.DesiredUpdatedReplicas)
+		return nil
+	}
+
+	// Step 3: Calculate the number of pods to delete
+	needToDelete := ctx.DesiredUpdatedReplicas - updatedPods
+
+	klog.Infof("Current status - updatedPods: %d, desired: %d, needToDelete: %d, available: %d",
+		updatedPods, ctx.DesiredUpdatedReplicas, needToDelete, len(podsToDelete))
+
+	// Step 4: Apply maxUnavailable constraint
 	maxUnavailable := int32(1) // Default value
 	if rc.object.Spec.UpdateStrategy.RollingUpdate != nil && rc.object.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable != nil {
 		maxUnavailableValue, err := intstr.GetScaledValueFromIntOrPercent(rc.object.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable, int(rc.Replicas), false)
@@ -161,59 +191,57 @@ func (rc *realController) UpgradeBatch(ctx *batchcontext.BatchContext) error {
 		}
 	}
 
-	// Limit the number of pods to delete based on maxUnavailable
+	// Ensure we don't exceed the maxUnavailable limit
 	if needToDelete > maxUnavailable {
 		needToDelete = maxUnavailable
+		klog.Infof("Limited needToDelete from %d to %d due to maxUnavailable constraint",
+			ctx.DesiredUpdatedReplicas-updatedPods, needToDelete)
 	}
 
-	// List pods that are not yet updated (still on old revision)
-	var podsToDelete []*corev1.Pod
-	for _, pod := range ctx.Pods {
-		// Skip if pod is already marked for deletion
-		if !pod.DeletionTimestamp.IsZero() {
-			continue
-		}
-
-		// Skip if pod is already on the update revision
-		if util.IsConsistentWithRevision(pod.GetLabels(), ctx.UpdateRevision) {
-			continue
-		}
-
-		// Add to deletion list
-		podsToDelete = append(podsToDelete, pod)
-
-		// Stop when we have enough pods to delete
-		if int32(len(podsToDelete)) >= needToDelete {
-			break
-		}
+	// Limit deletion count to available pod count
+	if needToDelete > int32(len(podsToDelete)) {
+		needToDelete = int32(len(podsToDelete))
+		klog.Infof("Limited needToDelete to available pods: %d", needToDelete)
 	}
 
-	// Sort pods by creation timestamp to delete oldest first (more predictable behavior)
+	if needToDelete <= 0 {
+		klog.Infof("No pods need to be deleted")
+		return nil
+	}
+
+	klog.Infof("Planning to delete %d pods (maxUnavailable: %d)", needToDelete, maxUnavailable)
+
+	// Step 5: Execute deletion
+	// Sort pods by creation timestamp to delete oldest first
 	sort.Slice(podsToDelete, func(i, j int) bool {
 		return podsToDelete[i].CreationTimestamp.Before(&podsToDelete[j].CreationTimestamp)
 	})
 
-	// Delete the required number of pods
-	for _, pod := range podsToDelete {
+	deletedCount := int32(0)
+	for i := int32(0); i < needToDelete && i < int32(len(podsToDelete)); i++ {
+		pod := podsToDelete[i]
+		klog.Infof("About to delete pod %s/%s (created: %v)", pod.Namespace, pod.Name, pod.CreationTimestamp)
+
 		err := rc.client.Delete(context.TODO(), pod)
 		if err != nil {
+			klog.Errorf("Failed to delete pod %s/%s: %v", pod.Namespace, pod.Name, err)
 			return fmt.Errorf("failed to delete pod %s/%s: %v", pod.Namespace, pod.Name, err)
 		}
-	}
 
+		klog.Infof("Successfully deleted pod %s/%s", pod.Namespace, pod.Name)
+		deletedCount++
+	}
+	time.Sleep(5 * time.Second) // Short delay to allow API server to process deletions
+
+	klog.Infof("Deleted %d pods in this execution", deletedCount)
 	return nil
 }
 
 // Finalize cleans up the annotations and restores the original update strategy.
+// It also removes the "pod-template-hash" label from all pods controlled by the DaemonSet.
 func (rc *realController) Finalize(release *v1beta1.BatchRelease) error {
 	if rc.object == nil {
 		return nil
-	}
-
-	// Restore the original setting and remove annotation
-	setting, err := control.GetOriginalDaemonSetSetting(rc.object)
-	if err != nil {
-		return err
 	}
 
 	var specBody string
@@ -222,23 +250,57 @@ func (rc *realController) Finalize(release *v1beta1.BatchRelease) error {
 		updateStrategy := apps.DaemonSetUpdateStrategy{
 			Type: apps.RollingUpdateDaemonSetStrategyType,
 		}
-		if setting.MaxUnavailable != nil || setting.MaxSurge != nil {
-			updateStrategy.RollingUpdate = &apps.RollingUpdateDaemonSet{}
-			if setting.MaxUnavailable != nil {
-				updateStrategy.RollingUpdate.MaxUnavailable = setting.MaxUnavailable
-			}
-			if setting.MaxSurge != nil {
-				updateStrategy.RollingUpdate.MaxSurge = setting.MaxSurge
-			}
-		}
 		strategyBytes, _ := json.Marshal(updateStrategy)
 		specBody = fmt.Sprintf(`,"spec":{"updateStrategy":%s}`, string(strategyBytes))
 	}
 
-	body := fmt.Sprintf(`{"metadata":{"annotations":{"%s":null,"%s":null},"labels":{"rollouts.kruise.io/stable-revision":null}}%s}`, util.BatchReleaseControlAnnotation, v1beta1.OriginalDeploymentStrategyAnnotation, specBody)
+	body := fmt.Sprintf(`{"metadata":{"annotations":{"%s":null},"labels":{"rollouts.kruise.io/stable-revision":null}}%s}`,
+		util.BatchReleaseControlAnnotation,
+		specBody)
 
 	daemon := util.GetEmptyObjectWithKey(rc.object)
-	return rc.client.Patch(context.TODO(), daemon, client.RawPatch(types.MergePatchType, []byte(body)))
+	if err := rc.client.Patch(context.TODO(), daemon, client.RawPatch(types.MergePatchType, []byte(body))); err != nil {
+		return err
+	}
+
+	// Clean up "pod-template-hash" label from all pods controlled by this DaemonSet
+	return rc.cleanupPodTemplateHashLabels()
+}
+
+// cleanupPodTemplateHashLabels removes the "pod-template-hash" label from all pods
+// controlled by the DaemonSet
+func (rc *realController) cleanupPodTemplateHashLabels() error {
+	// List all pods owned by this DaemonSet
+	pods, err := rc.ListOwnedPods()
+	if err != nil {
+		klog.Errorf("Failed to list owned pods: %v", err)
+		return err
+	}
+
+	// Remove "pod-template-hash" label from each pod
+	for _, pod := range pods {
+		// Check if the pod has the "pod-template-hash" label
+		if _, hasLabel := pod.Labels["pod-template-hash"]; !hasLabel {
+			continue
+		}
+
+		// Create a patch to remove the label
+		patch := fmt.Sprintf(`{"metadata":{"labels":{"pod-template-hash":null}}}`)
+		podClone := util.GetEmptyObjectWithKey(pod)
+
+		if err := rc.client.Patch(context.TODO(), podClone, client.RawPatch(types.MergePatchType, []byte(patch))); err != nil {
+			// Log the error but continue with other pods
+			klog.Errorf("Failed to remove pod-template-hash label from pod %s/%s: %v", pod.Namespace, pod.Name, err)
+			// Only return error if it's not a NotFound error
+			if !errors.IsNotFound(err) {
+				return err
+			}
+		} else {
+			klog.Infof("Successfully removed pod-template-hash label from pod %s/%s", pod.Namespace, pod.Name)
+		}
+	}
+
+	return nil
 }
 
 // CalculateBatchContext calculates the batch context for native DaemonSet.
@@ -278,7 +340,29 @@ func (rc *realController) CalculateBatchContext(release *v1beta1.BatchRelease) (
 	}
 
 	currentPartition := intstr.FromInt(0)
-	// Native DaemonSet doesn't use partition in the same way, but we'll set it for consistency
+
+	// compute updatedReadyReplicas by pods
+	// because DaemonSet has no updatedReadyReplicas field in status
+	// we have to calculate it by ourselves
+	var updatedReadyReplicas int32
+	if rc.pods != nil {
+		for _, pod := range rc.pods {
+			// Skip if pod is marked for deletion
+			if !pod.DeletionTimestamp.IsZero() {
+				continue
+			}
+
+			// Check if pod is on the update revision
+			if util.IsConsistentWithRevision(pod.GetLabels(), release.Status.UpdateRevision) {
+				if util.IsPodReady(pod) {
+					updatedReadyReplicas++
+				}
+			}
+		}
+	} else {
+		// Fallback to using status values if pods are not available
+		updatedReadyReplicas = rc.Status.UpdatedReadyReplicas
+	}
 
 	batchContext := &batchcontext.BatchContext{
 		Pods:                   rc.pods,
@@ -290,11 +374,14 @@ func (rc *realController) CalculateBatchContext(release *v1beta1.BatchRelease) (
 		FailureThreshold:       release.Spec.ReleasePlan.FailureThreshold,
 		Replicas:               rc.Replicas,
 		UpdatedReplicas:        rc.Status.UpdatedReplicas,
-		UpdatedReadyReplicas:   rc.Status.UpdatedReadyReplicas,
+		UpdatedReadyReplicas:   updatedReadyReplicas,
 		NoNeedUpdatedReplicas:  noNeedUpdate,
 		PlannedUpdatedReplicas: plannedUpdate,
 		DesiredUpdatedReplicas: desiredUpdate,
 	}
+
+	klog.Infof("BatchContext for DaemonSet %s/%s - Batch %d: updated=%d, ready=%d, desired=%d, pods=%d",
+		rc.key.Namespace, rc.key.Name, currentBatch, rc.Status.UpdatedReplicas, updatedReadyReplicas, desiredUpdate, len(rc.pods))
 
 	if noNeedUpdate != nil {
 		batchContext.FilterFunc = labelpatch.FilterPodsForUnorderedUpdate

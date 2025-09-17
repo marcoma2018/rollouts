@@ -247,7 +247,8 @@ func (r *ControllerFinder) getNativeDaemonSet(namespace string, ref *rolloutv1be
 	}
 
 	// Read stable revision from label (set by webhook)
-	stableRevision := daemonSet.Labels["rollouts.kruise.io/stable-revision"]
+	// Use DeploymentStableRevisionLabel for consistency, even though it's a DaemonSet
+	stableRevision := daemonSet.Labels[rolloutv1beta1.DeploymentStableRevisionLabel]
 	workload.StableRevision = stableRevision
 
 	// Calculate update revision based on template hash
@@ -264,7 +265,7 @@ func (r *ControllerFinder) getNativeDaemonSet(namespace string, ref *rolloutv1be
 	workload.InRolloutProgressing = true
 
 	// For rollback detection in native DaemonSet:
-	// Compare the stable revision (from label) with the canary revision (from template hash)
+	// Compare the stable revision with the canary revision
 	// If they match, it means we're rolling back to a previous version
 	if workload.StableRevision != "" && workload.StableRevision == workload.CanaryRevision {
 		workload.IsInRollback = true
